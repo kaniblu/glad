@@ -1,3 +1,29 @@
+# Faster GLAD 
+
+In terms of functionality, this fork is identical to the [base code](https://github.com/saleforce/glad),
+except that the training speed has been greatly improved.
+
+On a machine with the GTX 1080 GPU and the 6-th gen Intel CPU, the speed-up is about
+7 times.
+
+| Code       | Dataset         | Training Time       | Training Time per Epoch   |
+| ---------- | --------------- | ------------------- | ------------------------- |
+| [Original](https://github.com/salesforce/glad)   | WoZ   | 58.5 minutes      | 70 seconds
+| This fork  | WoZ             | 7.83 minutes        | 9.5 seconds               |
+
+The speedup is achieved by the following changes:
+
+  - [sequence masks](https://gist.github.com/jihunchoi/f1434a77df9db1bb337417854b398df1) 
+    are used in place of python `for` loops for padding `-inf` before applying
+    `torch.softmax`. (See self-attention and `attend` functions in `glad.py`.)
+  - the dialogue act inference now operates on the tensor-level instead of looping
+    through each data sample in a mini-batch. (See `Model.forward` method.)
+
+Using default options, current implementation achieves 87.1% joint goal accuracy,
+92.5% turn inform accuracy and 97.1% turn request accuracy.
+
+Following is the original README file.
+
 # Global-Locally Self-Attentive Dialogue State Tracker
 
 This repository contains an implementation of the [Global-Locally Self-Attentive Dialogue State Tracker (GLAD)](https://arxiv.org/abs/1805.09655).
@@ -12,8 +38,7 @@ If you use this in your work, please cite the following
 }
 ```
 
-
-# Install dependencies
+## Install dependencies
 
 Using Docker
 
@@ -29,7 +54,7 @@ If you do not want to build the Docker image, then run the following (you still 
 pip install -r requirements.txt
 ```
 
-# Download and annotate data
+## Download and annotate data
 
 This project uses Stanford CoreNLP to annotate the dataset.
 In particular, we use the [Stanford NLP Stanza python interface](https://github.com/stanfordnlp/stanza).
@@ -56,7 +81,7 @@ python preprocess_data.py
 ```
 
 
-# Train model
+## Train model
 
 You can checkout the training options via `python train.py -h`.
 By default, `train.py` will save checkpoints to `exp/glad/default`.
@@ -74,7 +99,7 @@ python train.py --gpu 0
 ```
 
 
-# Evaluation
+## Evaluation
 
 You can evaluate the model using
 
@@ -94,7 +119,7 @@ python evaluate.py --gpu 0 --split test exp/glad/default
 ```
 
 
-# Contribution
+## Contribution
 
 Pull requests are welcome!
 If you have any questions, please create an issue or contact the corresponding author at `victor <at> victorzhong <dot> com`.

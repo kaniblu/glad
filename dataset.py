@@ -61,6 +61,9 @@ class Turn:
         self.num['transcript'] = vocab.word2index(['<sos>'] + [w.lower() for w in self.transcript + ['<eos>']], train=True)
         self.num['system_acts'] = [vocab.word2index(['<sos>'] + [w.lower() for w in a] + ['<eos>'], train=True) for a in self.system_acts + [['<sentinel>']]]
 
+    def __repr__(self):
+        return f"Turn('{' '.join(self.transcript)}'')"
+
 
 class Dialogue:
 
@@ -81,6 +84,15 @@ class Dialogue:
     @classmethod
     def annotate_raw(cls, raw):
         return cls(raw['dialogue_idx'], [Turn.annotate_raw(t) for t in raw['dialogue']])
+
+    def __repr__(self):
+        if not self.turns:
+            return f"Dialog(<empty>)"
+        elif len(self.turns) == 1:
+            return f"Dialog({self.turns[0]})"
+        else:
+            return (f"Dialog({self.turns[0]}, "
+                    f"{len(self.turns) - 1} more turns...)")
 
 
 class Dataset:

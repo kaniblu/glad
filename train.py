@@ -22,15 +22,14 @@ def run(args):
     model = load_model(args.model, args, ontology, vocab)
     model.save_config()
     model.load_emb(Eword)
-
     model = model.to(model.device)
+    if args.resume:
+        model.load_best_save(directory=args.resume)
+    # pprint(model.run_eval(dataset["dev"], args))  # WARNING!!
     if not args.test:
         logging.info('Starting train')
         model.run_train(dataset['train'], dataset['dev'], args)
-    if args.resume:
-        model.load_best_save(directory=args.resume)
-    else:
-        model.load_best_save(directory=args.dout)
+    model.load_best_save(directory=args.dout)
     model = model.to(model.device)
     logging.info('Running dev evaluation')
     dev_out = model.run_eval(dataset['dev'], args)

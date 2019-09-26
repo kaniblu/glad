@@ -11,38 +11,45 @@ from collections import defaultdict
 from pprint import pformat
 
 
-def pad(seqs, emb, device, pad=0):
+def pad(seqs, emb, device, pad=0, max_len=None):
     lens = [len(s) for s in seqs]
-    max_len = max(lens)
-    padded = torch.LongTensor([s + (max_len-l) * [pad] for s, l in zip(seqs, lens)])
-    return emb(padded.to(device)), lens
+    if max_len is None:
+        max_len = max(lens)
+    padded = torch.LongTensor([s + (max_len - l) * [pad] for s, l in zip(seqs, lens)])
+    return emb(padded.to(device)), torch.LongTensor(lens).to(device)
 
 
-def run_rnn(rnn, inputs, lens):
-    # sort by lens
-    order = np.argsort(lens)[::-1].tolist()
-    reindexed = inputs.index_select(0, inputs.data.new(order).long())
-    reindexed_lens = [lens[i] for i in order]
-    packed = nn.utils.rnn.pack_padded_sequence(reindexed, reindexed_lens, batch_first=True)
+def run_rnn(rnn, inputs, lens: torch.LongTensor):
+    if not isinstance(lens, torch.Tensor):
+        lens = torch.LongTensor(lens).to(inputs.device)
+    lens = lens.clone()
+    # pad sequence to avoid rnn error when seq_len = 0
+    null_mask = lens == 0
+    lens[null_mask] += 1
+    packed = nn.utils.rnn.pack_padded_sequence(
+        inputs, lens,
+        batch_first=True,
+        enforce_sorted=False
+    )
     outputs, _ = rnn(packed)
-    padded, _ = nn.utils.rnn.pad_packed_sequence(outputs, batch_first=True, padding_value=0.)
-    reverse_order = np.argsort(order).tolist()
-    recovered = padded.index_select(0, inputs.data.new(reverse_order).long())
-    # reindexed_lens = [lens[i] for i in order]
-    # recovered_lens = [reindexed_lens[i] for i in reverse_order]
-    # assert recovered_lens == lens
-    return recovered
+    padded, _ = nn.utils.rnn.pad_packed_sequence(
+        outputs,
+        batch_first=True,
+        padding_value=0.,
+        total_length=inputs.size(1)
+    )
+    return padded
 
 
-def attend(seq, cond, lens):
+def attend(seq, cond, lens: torch.LongTensor):
     """
     attend over the sequences `seq` using the condition `cond`.
     """
+    if not isinstance(lens, torch.Tensor):
+        lens = torch.LongTensor(lens).to(seq.device)
+    mask = seq_mask(lens, seq.size(1))
     scores = cond.unsqueeze(1).expand_as(seq).mul(seq).sum(2)
-    max_len = max(lens)
-    for i, l in enumerate(lens):
-        if l < max_len:
-            scores.data[i, l:] = -np.inf
+    scores = scores.masked_fill(~mask, float("-inf"))
     scores = F.softmax(scores, dim=1)
     context = scores.unsqueeze(2).expand_as(seq).mul(seq).sum(1)
     return context, scores
@@ -63,6 +70,15 @@ class FixedEmbedding(nn.Embedding):
         return F.dropout(out, self.dropout, self.training)
 
 
+def seq_mask(lens: torch.Tensor, max_len=None):
+    size = lens.size()
+    lens = lens.view(-1)
+    if max_len is None:
+        max_len = lens.max().item()
+    enum = torch.arange(0, max_len, device=lens.device).long()
+    return (lens.unsqueeze(1) > enum.unsqueeze(0)).view(*size, max_len)
+
+
 class SelfAttention(nn.Module):
     """
     scores each element of the sequence with a linear layer and uses the normalized scores to compute a context over the sequence.
@@ -74,14 +90,20 @@ class SelfAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, inp, lens):
+        if not isinstance(lens, torch.Tensor):
+            lens = torch.LongTensor(lens).to(inp.device)
         batch_size, seq_len, d_feat = inp.size()
         inp = self.dropout(inp)
         scores = self.scorer(inp.contiguous().view(-1, d_feat)).view(batch_size, seq_len)
-        max_len = max(lens)
-        for i, l in enumerate(lens):
-            if l < max_len:
-                scores.data[i, l:] = -np.inf
-        scores = F.softmax(scores, dim=1)
+        mask = seq_mask(lens, inp.size(1))
+        scores = scores.masked_fill(~mask, float("-inf"))
+        # avoid nan error for seq_len = 0
+        scores = scores.masked_fill((lens == 0).unsqueeze(-1), 0.0)
+        # ### old ###
+        # for i, l in enumerate(lens):
+        #     if l < max_len:
+        #         scores.data[i, l:] = -np.inf
+        scores = torch.softmax(scores, dim=1)
         context = scores.unsqueeze(2).expand_as(inp).mul(inp).sum(1)
         return context
 
@@ -104,9 +126,14 @@ class GLADEncoder(nn.Module):
         nn.init.uniform_(self.beta_raw, -0.01, 0.01)
 
     def beta(self, slot):
-        return F.sigmoid(self.beta_raw[self.slots.index(slot)])
+        return torch.sigmoid(self.beta_raw[self.slots.index(slot)])
 
     def forward(self, x, x_len, slot, default_dropout=0.2):
+        """
+            x: FloatTensor [batch_size, seq_len, dim]
+            x_len: List[Int]
+            slot: str
+        """
         local_rnn = getattr(self, '{}_rnn'.format(slot))
         local_selfattn = getattr(self, '{}_selfattn'.format(slot))
         beta = self.beta(slot)
@@ -130,6 +157,8 @@ class Model(nn.Module):
         self.ontology = ontology
         self.emb_fixed = FixedEmbedding(len(vocab), args.demb, dropout=args.dropout.get('emb', 0.2))
 
+        ontology = None
+        self.eos_idx = self.vocab.word2index('<eos>')
         self.utt_encoder = GLADEncoder(args.demb, args.dhid, self.ontology.slots, dropout=args.dropout)
         self.act_encoder = GLADEncoder(args.demb, args.dhid, self.ontology.slots, dropout=args.dropout)
         self.ont_encoder = GLADEncoder(args.demb, args.dhid, self.ontology.slots, dropout=args.dropout)
@@ -151,36 +180,63 @@ class Model(nn.Module):
         self.emb_fixed.weight.data.copy_(new(Eword))
 
     def forward(self, batch):
+        ontology = {
+            s: tuple(t.to(self.device) for t in 
+                     pad(v, self.emb_fixed, self.emb_fixed.weight.device,
+                         pad=self.eos_idx))
+            for s, v in self.ontology.num.items()
+        }
         # convert to variables and look up embeddings
-        eos = self.vocab.word2index('<eos>')
-        utterance, utterance_len = pad([e.num['transcript'] for e in batch], self.emb_fixed, self.device, pad=eos)
-        acts = [pad(e.num['system_acts'], self.emb_fixed, self.device, pad=eos) for e in batch]
-        ontology = {s: pad(v, self.emb_fixed, self.device, pad=eos) for s, v in self.ontology.num.items()}
-
+        utterance, utterance_len = pad([e.num['transcript'] for e in batch], self.emb_fixed, self.device, pad=self.eos_idx)
+        # ### old ###
+        # acts = [pad(e.num['system_acts'], self.emb_fixed, self.device, pad=self.eos_idx) for e in batch]
+        # ### new ###
+        max_act_len = max(max(map(len, e.num["system_acts"])) for e in batch)
+        acts, act_lens = list(zip(*(pad(e.num['system_acts'], self.emb_fixed, self.device, pad=self.eos_idx, max_len=max_act_len) for e in batch)))
+        max_act_num = max(map(len, (e.num["system_acts"] for e in batch)))
+        acts = torch.stack([act if len(act) == max_act_num else torch.cat([act, act.new(max_act_num - len(act), *act.size()[1:]).zero_()]) for act in acts])
+        act_lens2 = torch.LongTensor(list(map(len, act_lens))).to(acts.device)
+        act_lens = torch.stack([lens if len(lens) == max_act_num else torch.cat([lens, lens.new(max_act_num - len(lens)).zero_()]) for lens in act_lens])
         ys = {}
         for s in self.ontology.slots:
             # for each slot, compute the scores for each value
-            H_utt, c_utt = self.utt_encoder(utterance, utterance_len, slot=s)
-            _, C_acts = list(zip(*[self.act_encoder(a, a_len, slot=s) for a, a_len in acts]))
-            _, C_vals = self.ont_encoder(ontology[s][0], ontology[s][1], slot=s)
+            h_utt, c_utt = self.utt_encoder(utterance, utterance_len, slot=s)
+            # ### old ###
+            # _, c_acts = list(zip(*[self.act_encoder(a, a_len, slot=s) for a, a_len in acts]))
+            # ### new ###
+            _, c_acts = self.act_encoder(acts.view(-1, *acts.size()[2:]), act_lens.view(-1), slot=s)
+            c_acts = c_acts.reshape(len(batch), max_act_num, -1)
+            _, c_vals = self.ont_encoder(ontology[s][0], ontology[s][1], slot=s)
 
             # compute the utterance score
-            y_utts = []
-            q_utts = []
-            for c_val in C_vals:
-                q_utt, _ = attend(H_utt, c_val.unsqueeze(0).expand(len(batch), *c_val.size()), lens=utterance_len)
-                q_utts.append(q_utt)
-            y_utts = self.utt_scorer(torch.stack(q_utts, dim=1)).squeeze(2)
+            # ### old ###
+            # q_utts = []
+            # for c_val in c_vals:
+            #     q_utt, _ = attend(h_utt, c_val.unsqueeze(0).expand(len(batch), *c_val.size()), lens=utterance_len)
+            #     q_utts.append(q_utt)
+            # y_utts = self.utt_scorer(torch.stack(q_utts, dim=1)).squeeze(2)
+            # ### new ###
+            q_utts, _ = attend(h_utt.unsqueeze(1).expand(len(batch), len(c_vals), *h_utt.size()[1:]).reshape(-1, *h_utt.size()[1:]),
+                               c_vals.unsqueeze(0).expand(len(batch), len(c_vals), -1).reshape(-1, c_vals.size(-1)),
+                               lens=utterance_len.unsqueeze(-1).expand(len(batch), len(c_vals)).reshape(-1))
+            q_utts = q_utts.view(len(batch), len(c_vals), -1)
+            y_utts = self.utt_scorer(q_utts).squeeze(2)
+            # y_utts: [batch_size, num_acts]
 
             # compute the previous action score
-            q_acts = []
-            for i, C_act in enumerate(C_acts):
-                q_act, _ = attend(C_act.unsqueeze(0), c_utt[i].unsqueeze(0), lens=[C_act.size(0)])
-                q_acts.append(q_act)
-            y_acts = torch.cat(q_acts, dim=0).mm(C_vals.transpose(0, 1))
+            # ### old ###
+            # q_acts = []  # [batch_size, dim]
+            # for i, c_act in enumerate(c_acts):
+            #     q_act, _ = attend(c_act.unsqueeze(0), c_utt[i].unsqueeze(0), lens=[c_act.size(0)])
+            #     q_acts.append(q_act)
+            # y_acts = torch.cat(q_acts, dim=0).mm(c_vals.transpose(0, 1))
+            # ### new ###
+            q_acts, _ = attend(c_acts, c_utt, lens=act_lens2)
+            y_acts = q_acts.mm(c_vals.transpose(0, 1))
+            # y_acts: [batch_size, num_acts]
 
             # combine the scores
-            ys[s] = F.sigmoid(y_utts + self.score_weight * y_acts)
+            ys[s] = torch.sigmoid(y_utts + self.score_weight * y_acts)
 
         if self.training:
             # create label variable and compute loss
@@ -188,7 +244,8 @@ class Model(nn.Module):
             for i, e in enumerate(batch):
                 for s, v in e.turn_label:
                     labels[s][i][self.ontology.values[s].index(v)] = 1
-            labels = {s: torch.Tensor(m).to(self.device) for s, m in labels.items()}
+            labels = {s: torch.Tensor(m).to(self.device)
+                      for s, m in labels.items()}
 
             loss = 0
             for s in self.ontology.slots:
@@ -221,12 +278,12 @@ class Model(nn.Module):
             for batch in train.batch(batch_size=args.batch_size, shuffle=True):
                 iteration += 1
                 self.zero_grad()
-                loss, scores = self.forward(batch)
+                loss, _ = self.forward(batch)
                 loss.backward()
                 self.optimizer.step()
                 track['loss'].append(loss.item())
 
-            # evalute on train and dev
+            # evaluate on train and dev
             summary = {'iteration': iteration, 'epoch': epoch}
             for k, v in track.items():
                 summary[k] = sum(v) / len(v)

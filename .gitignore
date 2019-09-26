@@ -13,3 +13,4 @@ Mar*/
 *.zip
 *.gzip
 *.tar
+.idea/
