@@ -95,6 +95,12 @@ class Dialogue:
                     f"{len(self.turns) - 1} more turns...)")
 
 
+def harmonic_mean(arr: np.ndarray):
+    if (arr == 0).any():
+        return 0.0
+    return 1 / (1 / arr).mean()
+
+
 class Dataset:
 
     def __init__(self, dialogues):
@@ -169,7 +175,9 @@ class Dataset:
                     pred_recovered.add(('inform', s, v))
                 joint_goal.append(gold_recovered == pred_recovered)
                 i += 1
-        return {'turn_inform': np.mean(inform), 'turn_request': np.mean(request), 'joint_goal': np.mean(joint_goal)}
+        results = {'turn_inform': np.mean(inform), 'turn_request': np.mean(request), 'joint_goal': np.mean(joint_goal)}
+        results["hmean"] = harmonic_mean(np.array(list(results.values())))
+        return results
 
     def record_preds(self, preds, to_file):
         data = self.to_dict()
